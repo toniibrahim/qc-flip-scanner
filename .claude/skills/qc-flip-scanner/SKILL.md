@@ -28,7 +28,7 @@ Run these steps in order on every trigger. Stop early only if Step 3 returns zer
 
 ### Step 1 — Sweep Listing Sources
 
-Search the live listing portals below for active residential listings in the priority areas. Use first Firecrawl_MCP connector first and if it did not work, Use `web_search` and `web_fetch`. If the routine has Firecrawl, Playwright, or a similar MCP scraping connector, prefer it over raw `web_fetch` for JS-heavy pages like Centris.
+Search the live listing portals below for active residential listings in the priority areas. Use only Firecrawl_MCP connector for all pages including JS-heavy pages like Centris.
 
 Primary sources to query:
 
