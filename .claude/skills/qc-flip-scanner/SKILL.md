@@ -9,6 +9,43 @@ This skill drives a scheduled cloud routine that screens the Greater Montreal re
 
 ---
 
+## 0. Tool Discipline — READ FIRST, APPLIES THROUGHOUT
+
+This section is a hard constraint on every other section. It overrides any wording elsewhere in this skill that might suggest a different tool.
+
+### Allowed tools for fetching web data
+
+| Purpose | Tool to use |
+|---|---|
+| Find listing URLs by area / price / type | `Firecrawl_MCP:firecrawl_search` |
+| Discover all listing URLs on a portal section | `Firecrawl_MCP:firecrawl_map` |
+| Load a specific listing page and read its contents | `Firecrawl_MCP:firecrawl_scrape` |
+| Pull structured fields (price, beds, baths, etc.) from a listing | `Firecrawl_MCP:firecrawl_extract` with a JSON schema |
+| Crawl a whole brokerage section | `Firecrawl_MCP:firecrawl_crawl` |
+| Read the routine's own GitHub repo (broker feeds, prior scans) | the GitHub connector tools |
+| Compose / send the daily email | the Gmail connector tools |
+
+### Forbidden tools
+
+- **`web_search` — NEVER call this tool in this skill.** Quebec real estate portals do not render usefully through search snippets, and falling back to search snippets is the failure mode this skill exists to prevent.
+- **`web_fetch` — NEVER call this tool in this skill.** Centris, REALTOR.ca, DuProprio, and the major brokerages return HTTP 403 to raw fetchers. Attempting them wastes the run and risks contaminating the output with snippet text.
+- **No other built-in browsing tool.** If a tool isn't in the Allowed table above, do not call it for listing or comparable data.
+
+### What to do if Firecrawl fails
+
+If a `firecrawl_*` call returns an error, a rate-limit response, or an empty result that looks like a block:
+
+1. **Do not** retry with `web_search` or `web_fetch`. Those will not work and the output will be polluted.
+2. Retry the same Firecrawl call once with a slightly different query (broader area, fewer filters).
+3. If that also fails, mark the source as `BLOCKED` for this run and continue to the next source.
+4. If **every** Firecrawl call in Step 1 fails, abort the run per §14 — emit a single-row table stating `NO LIVE DATA AVAILABLE — Firecrawl connector failed across all sources`, plus the full disclosure block. Do not fabricate.
+
+### Verification (Claude must do this internally before Step 1)
+
+Before starting Step 1, confirm that `firecrawl_search` and `firecrawl_scrape` are available as tools in this session. If they are not present, abort with a single-row table stating `NO LIVE-DATA CONNECTOR ATTACHED — Firecrawl MCP not configured on this routine`. Do not attempt to substitute `web_search` or `web_fetch`.
+
+---
+
 ## 1. Mission
 
 Identify properties where:
@@ -24,50 +61,73 @@ A cheap property is **not** automatically a good deal. A property is worth pursu
 
 ## 2. Execution Workflow
 
-Run these steps in order on every trigger. Stop early only if Step 3 returns zero live candidates.
+Run these steps in order on every trigger. Stop early only if Step 3 returns zero live candidates. All web data flows through Firecrawl per §0 — there are no exceptions.
 
-### Step 1 — Sweep Listing Sources
+### Step 1 — Discover Candidate Listings via Firecrawl
 
-Search the live listing portals below for active residential listings in the priority areas. Use only Firecrawl_MCP connector for all pages including JS-heavy pages like Centris.
+For each priority area (§3), call `Firecrawl_MCP:firecrawl_search` with a natural-language query describing the target. Do **not** build a Google-style search-engine query — Firecrawl interprets natural language and dispatches its own scrapers.
 
-Primary sources to query:
+**Good Firecrawl queries (use these patterns):**
 
-- Centris (`centris.ca`)
+- `"single-family houses for sale in Laval Quebec between 400000 and 600000 CAD"`
+- `"bungalows for sale Brossard Quebec under 550000"`
+- `"detached houses Saint-Eustache Quebec 450000 to 600000"`
+- `"maisons à vendre Longueuil entre 400000 et 600000"`
+
+**Sources Firecrawl will reach for you** (do not call these directly):
+
+- Centris (centris.ca)
 - REALTOR.ca
-- RE/MAX Quebec, Royal LePage, Sutton Quebec, Via Capitale, Engel & Völkers
+- RE/MAX Québec, Royal LePage, Sutton Québec, Via Capitale, Engel & Völkers
 - DuProprio
-- Individual broker / brokerage pages returned in search results
+- Individual brokerage and broker pages
 
-Build queries that combine: target city + price range + property type. Example: `"maison à vendre Laval 450000 600000 site:centris.ca"`.
+For each area, run one `firecrawl_search` call. Collect the candidate listing URLs and short summaries it returns. Then for each candidate URL that looks promising, call `Firecrawl_MCP:firecrawl_scrape` to load the full page contents.
+
+**Alternative for known portal sections:** if there's a stable Centris or REALTOR.ca search URL for a sector (e.g. a saved-search link), use `Firecrawl_MCP:firecrawl_map` to enumerate listing URLs from it, then `firecrawl_scrape` each.
+
+**Broker feed check (Level 2 source, highest priority):** before running Firecrawl, check whether a broker MLS export exists in the repo at `/broker-feeds/`. If a file dated within the last 7 days is present, parse it as the primary candidate source. Firecrawl then supplements rather than replaces.
 
 ### Step 2 — Filter Against Criteria
 
-Drop any candidate that fails the hard filters in §3, §4, §5. Keep candidates that pass even if some data is missing — flag what is missing for §11 disclosure.
+Drop any candidate that fails the hard filters in §3, §4, §5. Keep candidates that pass even if some data is missing — flag what is missing for §12 disclosure.
 
-### Step 3 — Confirm Live Availability
+### Step 3 — Confirm Live Availability via Firecrawl
 
-For every surviving candidate, attempt to load the listing page directly. Mark each as one of:
+For every surviving candidate, the listing page must have been loaded via `firecrawl_scrape` during this run. Mark each as one of:
 
-- `LIVE` — listing page loads and shows active status
-- `CONDITIONAL` / `PENDING` — shown explicitly on the page
-- `SOLD` / `REMOVED` — drop the candidate, do not analyze
-- `UNCONFIRMED` — page did not load, status not visible, or only cached snippet was available
+- `LIVE` — `firecrawl_scrape` returned the listing page successfully with active-listing markers
+- `CONDITIONAL` / `PENDING` — shown explicitly on the scraped page
+- `SOLD` / `REMOVED` — shown on the scraped page or scrape returned a 404 / "no longer available"; drop the candidate
+- `UNCONFIRMED` — `firecrawl_scrape` errored or returned suspicious content; flag for broker check, do not proceed to full analysis
 
-If status is `UNCONFIRMED`, keep the candidate but flag it in the output as needing broker confirmation before any further work.
+A candidate may be marked `LIVE` **only if `firecrawl_scrape` was called on its URL during this run**. Search summaries from Step 1 are not sufficient evidence of live status.
 
-### Step 4 — Collect Listing Data
+### Step 4 — Collect Listing Data via Firecrawl Output
 
-Pull from the live page (see §6 for full field list). Only record what is actually visible. Never invent values.
+Pull from the `firecrawl_scrape` result for each `LIVE` candidate (see §6 for the full field list). For listings where structured extraction would be more reliable than parsing markdown, call `Firecrawl_MCP:firecrawl_extract` with an explicit JSON schema covering: asking_price, address, property_type, bedrooms, bathrooms, living_area_sqft, lot_size, year_built, basement, garage, taxes, municipal_assessment, photo_count, description, broker_remarks, listing_url.
+
+Only record what `firecrawl_scrape` / `firecrawl_extract` actually returned. Never invent values. Missing field → record `Missing`, not a guess.
 
 ### Step 5 — Assess Condition & Renovation Scope
 
-From listing photos, description, and visible mechanical/exterior cues, classify the renovation level as **Light**, **Medium**, or **Full Gut** (§7). Note any red flags (§10).
+From the scraped photos, description, and visible mechanical/exterior cues in the Firecrawl output, classify renovation level as **Light**, **Medium**, or **Full Gut** (§7). Note any red flags (§10).
 
-### Step 6 — Estimate ARV
+If photo URLs were returned but image content is not directly readable, note this limitation in the disclosure — vision-based condition assessment is not available in this routine.
 
-Find renovated comparables in the same sector. Use the methodology in §8. Produce three resale scenarios: Conservative, Target, Optimistic.
+### Step 6 — Estimate ARV via Firecrawl Comparable Search
 
-**Critical rule:** in Quebec, sold prices are not always public. If broker-confirmed sold comparables are not in hand, the ARV is **based on public asking comparables, not confirmed sold comparables**. State this explicitly in the disclosure.
+Find renovated comparables in the same sector. Use `Firecrawl_MCP:firecrawl_search` again with comparable-focused queries:
+
+- `"recently sold renovated houses Laval Quebec 2025 2026"`
+- `"renovated bungalows for sale Brossard Quebec"`
+- `"comparable homes 3 bedroom 2 bathroom Saint-Eustache renovated"`
+
+Then `firecrawl_scrape` the most relevant 3–5 comparable URLs to extract pricing and feature details. Apply the comparable-match criteria in §8 to score each.
+
+Produce three resale scenarios: Conservative, Target, Optimistic.
+
+**Critical rule:** in Quebec, sold prices are not always public on portals. If broker-confirmed sold comparables are not in `/broker-feeds/`, the ARV is **based on public asking comparables, not confirmed sold comparables**. State this explicitly in the disclosure.
 
 ### Step 7 — Compute Profit
 
@@ -133,7 +193,7 @@ The asking price is the seller's requested price, not market value. A low asking
 
 ## 6. Listing Data to Collect
 
-Pull only what is visible on the live listing page:
+Pull only what `firecrawl_scrape` or `firecrawl_extract` actually returns from the live listing page:
 
 - Asking price
 - Address
@@ -147,12 +207,12 @@ Pull only what is visible on the live listing page:
 - Garage / driveway
 - Taxes (if shown)
 - Municipal assessment (if shown)
-- Photo count and what the photos reveal
+- Photo count and what the photos reveal (text descriptions / alt attributes from the scrape)
 - Seller description
 - Broker remarks (if shown)
 - Listing URL and source platform
 
-For each field, mark the **Source** (which platform), **Status** (Confirmed / Partial / Missing), and any **Notes**.
+For each field, mark the **Source** (which Firecrawl call returned it), **Status** (Confirmed / Partial / Missing), and any **Notes**.
 
 ---
 
@@ -188,9 +248,9 @@ Weak / negative: no basement, crawlspace only, low ceiling, no legal-bedroom win
 
 ### Source Hierarchy
 
-1. **Broker-provided Centris / MLS sold comparables** — strongest, when available.
-2. **Public market comparables** — similar renovated houses currently listed, recent sold data that is publicly visible, comparable active or expired listings.
-3. **Asking-price comparables only** — weakest reference. State the limitation.
+1. **Broker-provided Centris / MLS sold comparables** — strongest, when available. Check `/broker-feeds/` in the repo first.
+2. **Firecrawl-scraped public comparables** — recently sold (if public) or actively listed renovated houses in the same sector. Found via `firecrawl_search` and loaded via `firecrawl_scrape`.
+3. **Asking-price comparables only** — weakest reference. State the limitation explicitly in §12.
 
 ### Comparable Match Criteria
 
@@ -203,11 +263,7 @@ Same city, same sector, similar property type, similar lot size, similar living 
 
 ### Three Resale Scenarios
 
-For every candidate, output:
-
-- **Conservative ARV** — worst credible renovated resale.
-- **Target ARV** — most likely renovated resale.
-- **Optimistic ARV** — strong-market upside.
+For every candidate, output Conservative, Target, and Optimistic ARV.
 
 ---
 
@@ -227,21 +283,7 @@ Net Profit = Gross Profit − Selling / Holding / Financing / Transaction Costs
 
 ### Costs to Deduct After Gross Profit
 
-- Broker commission on resale
-- Notary fees
-- Welcome tax (Quebec land transfer tax / *taxe de bienvenue*)
-- Financing cost
-- Interest during holding period
-- Insurance during holding period
-- Utilities during holding period
-- Municipal taxes during holding period
-- School taxes during holding period
-- Permit allowance
-- Staging
-- Marketing
-- Cleaning
-- Contingency
-- Miscellaneous closing costs
+Broker commission on resale; notary fees; welcome tax (taxe de bienvenue); financing cost; interest during holding period; insurance during holding period; utilities during holding period; municipal taxes during holding period; school taxes during holding period; permit allowance; staging; marketing; cleaning; contingency; miscellaneous closing costs.
 
 ### Profit Targets
 
@@ -283,19 +325,14 @@ Every routine run must emit **exactly** the following two sections, in this orde
 Rules:
 - One row per candidate that survived Step 2.
 - All money values in CAD.
+- The **Source** column records which Firecrawl call produced the data (e.g. `firecrawl_search → firecrawl_scrape(centris.ca/...)`).
 - Use **Net Profit at Target ARV** in the Net Profit column.
-- If a value cannot be confirmed, write `EST` next to it (e.g. `520,000 EST`) and explain in the disclosure block.
+- If a value cannot be confirmed, write `EST` next to it and explain in the disclosure block.
 - If the candidate is `UNCONFIRMED` live, prefix the address with `⚠`.
 
 ### Section B — Per-Property Notes
 
-For each row, a short paragraph covering:
-
-- Why it survived the filters
-- Renovation scope reasoning
-- Which comparables were used and where they came from
-- Key risks
-- Open questions for the broker
+For each row, a short paragraph covering: why it survived filters; renovation scope reasoning; which comparables were used (with the Firecrawl URLs); key risks; open questions for the broker.
 
 ---
 
@@ -304,20 +341,23 @@ For each row, a short paragraph covering:
 Every run must end with a disclosure block that states:
 
 - **Scan timestamp** and **trigger source** (scheduled / API / manual).
-- **Sources actually reached** during this run (list which portals returned data, which were blocked or timed out).
+- **Tools called this run**: list each `firecrawl_*` tool call count and any errors / rate-limits encountered.
+- **Sources actually reached** during this run: which portals Firecrawl returned data for, which were blocked.
 - For each candidate:
-  - Whether the listing was confirmed live (`LIVE`, `CONDITIONAL`, `UNCONFIRMED`).
+  - Whether the listing was confirmed live (`LIVE`, `CONDITIONAL`, `UNCONFIRMED`) and which `firecrawl_scrape` URL backs the claim.
   - Where the asking price came from.
-  - Whether the ARV is supported by sold comparables or only by public asking comparables.
+  - Whether the ARV is supported by broker-feed sold comparables or only by Firecrawl-scraped asking comparables.
   - Whether renovation cost is based on photos only or on inspection documents.
   - Any municipal/legal item that needs broker or city confirmation.
 - **Data quality level per candidate** using this scale:
-  - **Level 1 — Confirmed**: directly visible from a live listing or official source.
-  - **Level 2 — Strong Market Data**: broker-confirmed sold comps, assessment roll, official zoning, official flood map.
-  - **Level 3 — Public Market Estimate**: active comparable listings, asking-price comps, public market examples.
+  - **Level 1 — Confirmed**: directly returned by `firecrawl_scrape` from a live listing or official source.
+  - **Level 2 — Strong Market Data**: broker-confirmed sold comps from `/broker-feeds/`, assessment roll, official zoning, official flood map.
+  - **Level 3 — Public Market Estimate**: active Firecrawl-scraped comparable listings, asking-price comps.
   - **Level 4 — Assumption**: estimated from experience and market logic (pre-inspection reno cost, hidden repair allowance, probable demand).
 
 A run with no `Level 1` or `Level 2` data for any candidate should be flagged at the top as **LOW-CONFIDENCE SCAN — BROKER CONFIRMATION REQUIRED BEFORE ANY ACTION**.
+
+A run where Firecrawl errored on all attempted sources should be flagged as **NO LIVE DATA AVAILABLE** per §0.
 
 ---
 
@@ -334,7 +374,7 @@ The Recommendation column in §11 must be one of:
 
 A property is worth pursuing only when **all** of the following are true:
 
-1. It is still live and available.
+1. It is still live and available (`firecrawl_scrape` confirmed during this run).
 2. The purchase price leaves enough room for renovation and profit.
 3. Renovated resale comparables support the after-renovation value.
 4. Renovation costs are realistic for Quebec contractor-market conditions.
@@ -349,12 +389,13 @@ If any of these fail, the recommendation is `Reject` regardless of how cheap the
 
 Because this skill runs in a scheduled cloud routine without a human in the loop:
 
+- **Tool discipline is non-negotiable.** Only the tools in §0 Allowed table. `web_search` and `web_fetch` are forbidden in this skill — period.
 - **Never fabricate data.** Missing field → write `Missing` and flag in the disclosure. Never guess sold prices, lot sizes, year built, or comparable values.
-- **Never claim a property is `LIVE` without loading its listing page during this run.** Search snippets are not sufficient.
+- **Never claim a property is `LIVE` without a successful `firecrawl_scrape` call on its URL during this run.** Search summaries are not sufficient.
 - **Never treat asking-price comparables as confirmed resale value.** Always degrade the ARV confidence accordingly.
 - **Always emit the disclosure block** even if it makes the run look weak. A weak honest run is more useful than a strong fabricated one.
-- **If zero candidates survive**, emit the table with a single row stating `No qualifying candidates this scan window`, plus the full disclosure block listing which sources were swept.
-- **If a source is blocked or rate-limited**, report it in the disclosure rather than silently skipping.
+- **If zero candidates survive Step 2**, emit the table with a single row stating `No qualifying candidates this scan window`, plus the full disclosure block listing which Firecrawl queries were attempted.
+- **If Firecrawl fails on all sources**, abort per §0 with `NO LIVE DATA AVAILABLE`. Do not fall back to `web_search`. A clean failure is better than fabricated confidence.
 - **Prefer fewer, well-supported A/B candidates** over a long list of C-grade noise.
 
 ---
@@ -376,6 +417,7 @@ Examples:
 - `[QC Flip Scan] 2026-05-18 — 7 candidates, 1A / 3B / 3C`
 - `[QC Flip Scan] 2026-05-18 — 0 candidates, no qualifying listings`
 - `[QC Flip Scan] 2026-05-18 — LOW-CONFIDENCE SCAN — broker confirmation required`
+- `[QC Flip Scan] 2026-05-18 — NO LIVE DATA — Firecrawl failed across all sources`
 
 If any sources were blocked or rate-limited during the run, append ` — partial sweep` to the subject.
 
@@ -383,59 +425,30 @@ If any sources were blocked or rate-limited during the run, append ` — partial
 
 The body is a single HTML email composed of the following blocks in this exact order:
 
-**Block 1 — One-line headline**
+**Block 1 — One-line headline** — a single sentence summarizing the scan and the trigger time.
 
-A single sentence summarizing the scan, e.g.
-*"Weekly QC flip sweep completed at 06:14 Kuwait time. Found 7 candidates, of which 1 grades A and 3 grade B."*
+**Block 2 — Top picks** (only if there are A or B grades) — a short bulleted list of the A-grade and B-grade rows: `{Grade} — {City sector} — {Property type} — Asking {Asking Price} — Net at Target {Net Profit} — {one-line recommendation}`. Max 5; if more, list top 5 by Net Profit and note "(+N more in the full table)".
 
-**Block 2 — Top picks (only if there are A or B grades)**
+**Block 3 — Full deal table** — the §11 Section A table as an HTML `<table>`. Right-align money columns. Light row stripe. Do not collapse any columns.
 
-A short bulleted list of the A-grade and B-grade rows, each line:
+**Block 4 — Per-property notes** — §11 Section B, one short paragraph per row, in table order.
 
-```
-{Grade} — {City sector} — {Property type} — Asking {Asking Price} — Net at Target {Net Profit} — {one-line recommendation}
-```
+**Block 5 — Disclosure block** — the full §12 disclosure as an HTML block with a thin left border. Do not abbreviate.
 
-Maximum 5 picks. If there are more, list the top 5 by Net Profit and note "(+N more in the full table)".
-
-**Block 3 — Full deal table**
-
-The complete table from §11 Section A, rendered as an HTML `<table>`. Right-align money columns. Use a light row stripe for readability. Do not collapse any columns.
-
-**Block 4 — Per-property notes**
-
-The §11 Section B per-property notes, one short paragraph per row, in the same order as the table.
-
-**Block 5 — Disclosure block**
-
-The full §12 disclosure, rendered as an HTML block with a thin left border so it visually separates from the analysis. Do not abbreviate. The disclosure is the audit trail and must be complete in every email.
-
-**Block 6 — Footer**
-
-A single line:
-
-```
-Generated by qc-flip-scanner routine · Trigger: {scheduled|API|manual} · Sources reached: {list} · Repo: {repo_url}
-```
+**Block 6 — Footer** — a single line: `Generated by qc-flip-scanner routine · Trigger: {scheduled|API|manual} · Firecrawl calls: {count} · Repo: {repo_url}`.
 
 ### Plain-text Fallback
 
-Include a plain-text alternative part on the message. The table in plain text is rendered using pipe-and-dash markdown (the same format as §11). Email clients that prefer plain text will see a fully readable scan.
+Include a plain-text alternative on the message. Plain table uses pipe-and-dash markdown.
 
 ### Recipients
 
-Recipients are configured in the **routine prompt**, not in this skill. The skill only formats the message — it never hardcodes an address.
+Configured in the routine prompt, not in this skill. The skill formats; it never hardcodes an address.
 
 ### When to Send
 
-Send the email on **every** completed run, including:
-
-- Zero-candidate runs (still send — confirms the routine fired and the scan window was clean)
-- `LOW-CONFIDENCE SCAN` runs (send with the warning flag in the subject)
-- `partial sweep` runs where some sources were blocked
-
-Do **not** send if the routine itself failed before producing the §11 + §12 output. In that case, leave the failure to the routine platform's own error reporting — a half-formed email would be worse than no email.
+Send the email on **every** completed run, including zero-candidate, low-confidence, and partial-sweep runs. Do **not** send if the routine itself errored before producing §11 + §12 (let the platform surface the failure).
 
 ### Single Send Guarantee
 
-Compose and send the email **once** per run. If the connector call fails, surface the error in the routine session log; do not retry from inside the skill (the routine platform will surface the failure).
+Compose and send the email **once** per run. If the Gmail connector call fails, surface the error in the routine session log; do not retry from inside the skill.
